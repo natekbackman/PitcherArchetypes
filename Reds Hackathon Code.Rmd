@@ -1,0 +1,636 @@
+---
+title: "Reds Hackathon Code"
+author: "Nathan Backman, Nolan Pittman, Jake Balek, Hunter Geise, Danielle Napierski"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# libraries #
+
+```{r}
+library(tidyverse)
+library(caret)
+library(rsample)
+library(cluster)    
+library(factoextra) 
+library(dendextend)
+library(NbClust)
+library(uuid)
+library(baseballr)
+```
+
+# read in data
+```{r}
+savant <- read.csv("savant_pitch_level.csv")
+fangraphs <- read.csv("fangraphs_season_level.csv")
+```
+
+# add statcast zones #
+
+# functions #
+
+```{r}
+heart_z <- function(sz_bot,sz_top) {
+  mid <- (sz_bot + sz_top)/2
+  bot <- mid - ((mid - sz_bot)*.67)
+  top <- mid + ((sz_top - mid)*.67)
+  return(c(bot,top))
+}
+
+shadow_z <- function(sz_bot,sz_top) {
+  mid <- (sz_bot + sz_top)/2
+  bot <- sz_bot - (mid*.33)
+  top <- sz_top + (mid*.33)
+  return(c(bot,top))
+}
+
+chase_z <- function(sz_bot,sz_top) {
+  mid <- (sz_bot + sz_top)/2
+  bot <- sz_bot - (mid*2)
+  top <- sz_top + (mid*2)
+  return(c(bot,top))
+}
+```
+
+# variables #
+
+```{r}
+heart_x <- 6.7/12
+shadow_x <- 13.3/12
+chase_x <- 20/12
+
+pb <- txtProgressBar(min = 0,      
+                     max = nrow(data), 
+                     style = 3,  
+                     width = 50, 
+                     char = "=")
+```
+
+# loop #
+
+```{r}
+
+savant %>% 
+  mutate(heart = 0,
+         shadow = 0,
+         chase = 0,
+         waste = 0) -> savant
+
+for (row in 1:nrow(savant)) {
+  if (is.na(savant$plate_x[row]) == T |
+      is.na(savant$plate_z[row]) == T |
+      is.na(savant$sz_top[row]) == T |
+      is.na(savant$sz_bot[row]) == T) {
+    savant$heart[row] <- NA
+    savant$shadow[row] <- NA
+    savant$chase[row] <- NA
+    savant$waste[row] <- NA
+  } else if (na.exclude(savant$plate_x[row]) < heart_x &
+             na.exclude(savant$plate_x[row]) > -heart_x &
+             savant$plate_z[row] <
+             heart_z(savant$sz_bot[row],savant$sz_top[row])[2] &
+             savant$plate_z[row] >
+             heart_z(savant$sz_bot[row],savant$sz_top[row])[1]) {
+    savant$heart[row] <- 1
+  } else if (savant$plate_x[row] < shadow_x &
+             savant$plate_x[row] > -shadow_x &
+             savant$plate_z[row] <
+             shadow_z(savant$sz_bot[row],savant$sz_top[row])[2] &
+             savant$plate_z[row] >
+             shadow_z(savant$sz_bot[row],savant$sz_top[row])[1]) {
+    savant$shadow[row] <- 1
+  } else if (savant$plate_x[row] < chase_x &
+             savant$plate_x[row] > -chase_x &
+             savant$plate_z[row] <
+             chase_z(savant$sz_bot[row],savant$sz_top[row])[2] &
+             savant$plate_z[row] >
+             chase_z(savant$sz_bot[row],savant$sz_top[row])[1]) {
+    savant$chase[row] <- 1
+  } else {
+    savant$waste[row] <- 1
+  }
+  setTxtProgressBar(pb, row)
+}
+
+
+  if (row %% 15044 == 0) {
+    print(glue("{round(row/nrow(savant)*100,0)}% done."))
+  } else {
+    invisible()
+  }
+```
+
+# get game situation #
+
+```{r}
+savant %>%
+  ungroup() %>% 
+  mutate(
+    on_1b_dummy = ifelse(is.na(on_1b), 0, 1),
+    on_2b_dummy = ifelse(is.na(on_2b), 0, 1),
+    on_3b_dummy = ifelse(is.na(on_3b), 0, 1)
+  ) -> savant
+
+paste(savant$on_1b_dummy,                  
+      savant$on_2b_dummy,
+      savant$on_3b_dummy,
+      savant$outs_when_up, 
+      sep = "-") -> savant$on1b_on2B_on3b_outs
+
+team_mappings <- c("LAA" = "108", "AZ" = "109", "BAL" = "110", 
+                   "BOS" = "111", "CHC" = "112", "CIN" = "113", 
+                   "CLE" = "114", "COL" = "115", "DET" = "116", 
+                   "HOU" = "117", "KC" = "118", "LAD" = "119", 
+                   "WSH" = "120", "OAK" = "133", "PIT" = "134",
+                   "SD" = "135", "SEA" = "136", "SF" = "137" ,
+                   "STL" = "138", "TB" = "139", "TEX" = "140", 
+                   "TOR" = "141", "MIN" = "142", "PHI" = "143", 
+                   "ATL" = "144", "CWS" = "145", "MIA" = "146", 
+                   "NYY" = "147", "NYM" = "121", "MIL" = "158" )
+
+savant %>% 
+  ungroup() %>% 
+  group_by(game_pk, pitcher, at_bat_number) %>% 
+  arrange(game_pk, pitcher, pitch_number_appearance) %>% 
+  mutate(ab_id = UUIDgenerate()) %>% 
+  filter(pitch_number_appearance == 1) %>% 
+  mutate(game_start = ifelse(balls == 0 &
+                               strikes == 0 &
+                               at_bat_number == 1,
+                             1, 0)) %>% 
+  filter(game_start == 0) %>% 
+  ungroup() -> savant2
+
+savant2 %>% 
+  select(game_pk, ab_id, pitcher, game_year, game_date, game_situation, 
+         inning, inning_topbot, home_team, away_team) %>% 
+  mutate(home_team_id = ifelse(home_team %in% names(team_mappings),
+                               team_mappings[home_team], home_team),
+         away_team_id = ifelse(away_team %in% names(team_mappings),
+                               team_mappings[away_team], away_team),
+         team_id = ifelse(inning_topbot == "Top", 
+                          home_team_id,
+                          away_team_id)) -> pitcher_management
+
+map(pitcher_management$ab_id, function(x) {
+  savant2 %>% 
+    ungroup() %>%
+    filter(ab_id == x) %>% 
+    select(game_pk) %>% 
+    distinct() %>% 
+    .[[1]] -> game_pk
+  savant2 %>% 
+    ungroup() %>%
+    filter(ab_id == x) %>% 
+    select(pitcher) %>% 
+    distinct() %>% 
+    .[[1]] -> pitcher
+  savant2 %>% 
+    ungroup() %>%
+    filter(ab_id == x) %>% 
+    select(inning) %>% 
+    distinct() %>% 
+    .[[1]] -> inning
+  savant2 %>% 
+    ungroup() %>%
+    filter(game_pk == game_pk &
+             pitcher == pitcher &
+             inning == inning) %>% 
+    drop_na(delta_run_exp) %>% 
+    summarise(mean_delta_run_exp = mean(delta_run_exp))
+}, .progress = TRUE) %>% 
+  bind_rows() -> d_run_exp
+
+cbind(pitcher_management, d_run_exp) -> pitcher_management
+```
+
+# manipulate fangraphs data with statcast measurements #
+
+```{r}
+savant %>%
+  ungroup() %>% 
+  drop_na(launch_speed_angle) %>% 
+  mutate(
+    weak = ifelse(launch_speed_angle == "1", 1, 0),
+    topped = ifelse(launch_speed_angle == "2", 1, 0),
+    under = ifelse(launch_speed_angle == "3", 1, 0),
+    flare = ifelse(launch_speed_angle == "4", 1, 0),
+    solid = ifelse(launch_speed_angle == "5", 1, 0),
+    barrel = ifelse(launch_speed_angle == "6", 1, 0),
+  ) %>% 
+  group_by(pitcher, game_year, role_key) %>% 
+  summarise(
+    weak_pct = sum(weak)/n(),
+    topped_pct = sum(topped)/n(),
+    under_pct = sum(under)/n(),
+    flare_pct = sum(flare)/n(),
+    solid_pct = sum(solid)/n(),
+    barrel_pct = sum(barrel)/n()
+  ) -> statcast_bb
+
+left_join(fangraphs, statcast_bb,
+          by = c("MLBAMID" = "pitcher",
+                 "Season" = "game_year",
+                 "Role" = "role_key")) -> fangraphs
+
+savant %>% 
+  filter(bb_type != "") %>% 
+  mutate(
+    gb = ifelse(bb_type == "ground_ball", 1, 0),
+    fb = ifelse(bb_type == "fly_ball", 1, 0),
+    ld = ifelse(bb_type == "line_drive", 1, 0),
+    pu = ifelse(bb_type == "popup", 1, 0)
+  ) %>% 
+  group_by(pitcher, game_year, role_key) %>% 
+  summarise(
+    gb_pct = sum(gb)/n(),
+    fb_pct = sum(fb)/n(),
+    ld_pct = sum(ld)/n(),
+    pu_pct = sum(pu)/n()
+  ) -> statcast_bb_2
+
+left_join(fangraphs, statcast_bb_2,
+          by = c("MLBAMID" = "pitcher",
+                 "Season" = "game_year",
+                 "Role" = "role_key")) -> fangraphs
+
+savant %>% 
+  drop_na(shadow) %>% 
+  mutate(shadow_pitch = ifelse(shadow == "1", 1, 0)) %>% 
+  group_by(pitcher, game_year, role_key) %>% 
+  summarise(shadow_rate = sum(shadow_pitch)/n()) -> shadow_rate
+
+left_join(fangraphs, shadow_rate,
+          by = c("MLBAMID" = "pitcher",
+                 "Season" = "game_year",
+                 "Role" = "role_key")) -> fangraphs
+```
+
+# creating clusters based on batted balls #
+
+## Data Manipulation
+
+```{r}
+predictors <- c("weak_pct", "topped_pct", "under_pct", "flare_pct",
+                "solid_pct", "barrel_pct",
+                "gb_rate", "fb_rate", "ld_rate", "pu_rate")
+
+# reference data
+fangraphs %>%
+  group_by(Season) %>%
+  filter(TBF >= 50) %>%
+  mutate(across(.cols = predictors, ~ntile(., 100), 
+                .names = "{.col}_percentile")) %>%
+  ungroup() %>% 
+  select(MLBAMID, Season, Role, all_of(predictors),
+         contains("percentile")) -> agnes_data 
+
+# model data
+agnes_data %>% 
+  select(contains("percentile")) -> model_data 
+```
+
+## Optimizing K Clusters
+
+```{r}
+set.seed(3422354)
+
+# WSS method
+fviz_nbclust(model_data, FUN = hcut, method = "wss")$data %>% 
+  rename(wss = y) -> wss
+
+# Silhouette method
+fviz_nbclust(model_data, FUN = hcut, 
+             method = "silhouette")$data %>% 
+  rename(mean_silhouette_width = y) -> silhouette
+
+# Gap stat method
+clusGap(model_data, FUN = hcut, K.max = 10,
+        B = 50, method = "firstSEmax") -> gap_stat
+
+gap_stat[["Tab"]] %>% 
+  as_tibble() %>% 
+  mutate(clusters = row_number()) -> gap_stat_table
+
+# Visualize gap stat
+fviz_gap_stat(gap_stat)
+
+# look at all metrics
+merge(
+  merge(gap_stat_table, wss, by = "clusters"), 
+  silhouette, by = "clusters"
+  ) -> all_metrics
+```
+
+## Final Clustering
+
+```{r}
+set.seed(123)
+
+# final clusters
+final <- agnes(model_data, method = "ward", metric = "euclidean")
+#use single with normal data
+
+# optimal bb clusters
+k <- 4 
+final_clusters <- cutree(as.hclust(final), k = k)
+table(final_clusters)
+
+# Visualizing clusters
+fviz_cluster(list(data = model_data, 
+                  cluster = final_clusters), labelsize = 4)
+
+agnes_data %>% 
+  mutate(cluster = final_clusters) -> bb_cluster_data
+
+# Looking at accuracy of all method types in agnes
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+
+ac <- function(x) {
+  agnes(model_data, method = x)$ac
+}
+
+map_dbl(m, ac)
+```
+
+# creating clusters based on plate discipline #
+
+## Data Manipulation
+
+```{r}
+predictors <- c("K_pct", "BB_pct", "OSwing_pct", "ZSwing_pct",
+                "OContact_pct", "ZContact_pct", "Swing_pct",
+                "Zone_pct", "shadow_rate", "FStrike_pct",
+                "Contact_pct", "SwStr_pct", "CStr_pct")
+
+# reference data
+fangraphs %>%
+  group_by(Season) %>%
+  filter(TBF >= 50) %>%
+  mutate(across(.cols = predictors, ~ntile(., 100), 
+                .names = "{.col}_percentile")) %>%
+  ungroup() %>% 
+  select(MLBAMID, Season, Role, all_of(predictors),
+         contains("percentile")) -> agnes_data 
+
+# model data
+agnes_data %>% 
+  select(contains("percentile")) -> model_data 
+```
+
+## Optimizing K Clusters
+
+```{r}
+set.seed(3422354)
+
+# WSS method
+fviz_nbclust(model_data, FUN = hcut, method = "wss")$data %>% 
+  rename(wss = y) -> wss
+
+# Silhouette method
+fviz_nbclust(model_data, FUN = hcut, 
+             method = "silhouette")$data %>% 
+  rename(mean_silhouette_width = y) -> silhouette
+
+# Gap stat method
+
+clusGap(model_data, FUN = hcut, K.max = 10,
+        B = 50, method = "firstSEmax") -> gap_stat
+
+gap_stat[["Tab"]] %>% 
+  as_tibble() %>% 
+  mutate(clusters = row_number()) -> gap_stat_table
+
+# Visualize gap stat
+fviz_gap_stat(gap_stat)
+
+# look at all metrics
+merge(
+  merge(gap_stat_table, wss, by = "clusters"), 
+  silhouette, by = "clusters"
+  ) -> all_metrics
+```
+
+## Final Clustering
+
+```{r}
+set.seed(123)
+
+final <- agnes(model_data, method = "ward", metric = "euclidean")
+
+# optimal pd clusters
+k <- 3 
+final_clusters <- cutree(as.hclust(final), k = k)
+table(final_clusters)
+
+# Visualizing clusters
+fviz_cluster(list(data = model_data, 
+                  cluster = final_clusters), labelsize = 4)
+
+agnes_data %>% 
+  mutate(cluster = final_clusters) -> pd_cluster_data
+
+# Looking at accuracy of all method types in agnes
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+
+ac <- function(x) {
+  agnes(model_data, method = x)$ac
+}
+
+map_dbl(m, ac)
+```
+
+# creating clusters for reliever roles #
+
+## manipulate pitcher_management data
+
+```{r}
+# inherited runners in scoring position
+irisp <- c("0-0-1-0", "0-0-1-1", "0-0-1-2",
+           "0-1-0-0", "0-1-0-1", "0-1-0-2",
+           "0-1-1-0", "0-1-1-1", "0-1-1-2",
+           "1-0-1-0", "1-0-1-1", "1-0-1-2",
+           "1-1-1-0", "1-1-1-1", "1-1-1-2",
+           "1-1-0-0", "1-1-0-1", "1-1-0-2")
+
+pitcher_management %>% 
+  mutate(game_situation = as.factor(game_situation),
+         bases_empty_no_out = ifelse(game_situation == "0-0-0-0", 1, 0),
+         bases_empty_one_out = ifelse(game_situation == "0-0-0-1", 1, 0),
+         bases_empty_two_out = ifelse(game_situation == "0-0-0-2", 1, 0),
+         rot_no_out = ifelse(game_situation == "0-0-1-0", 1, 0),
+         rot_one_out = ifelse(game_situation == "0-0-1-1", 1, 0),
+         rot_two_out = ifelse(game_situation == "0-0-1-2", 1, 0),
+         ros_no_out = ifelse(game_situation == "0-1-0-0", 1, 0),
+         ros_one_out = ifelse(game_situation == "0-1-0-1", 1, 0),
+         ros_two_out = ifelse(game_situation == "0-1-0-2", 1, 0),
+         rost_no_out = ifelse(game_situation == "0-1-1-0", 1, 0),
+         rost_one_out = ifelse(game_situation == "0-1-1-1", 1, 0),
+         rost_two_out = ifelse(game_situation == "0-1-1-2", 1, 0),
+         rof_no_out = ifelse(game_situation == "1-0-0-0", 1, 0),
+         rof_one_out = ifelse(game_situation == "1-0-0-1", 1, 0),
+         rof_two_out = ifelse(game_situation == "1-0-0-2", 1, 0),
+         corners_no_out = ifelse(game_situation == "1-0-1-0", 1, 0),
+         corners_one_out = ifelse(game_situation == "1-0-1-1", 1, 0),
+         corners_two_out = ifelse(game_situation == "1-0-1-2", 1, 0),
+         rofs_no_out = ifelse(game_situation == "1-1-0-0", 1, 0),
+         rofs_one_out = ifelse(game_situation == "1-1-0-1", 1, 0),
+         rofs_two_out = ifelse(game_situation == "1-1-0-2", 1, 0),
+         loaded_no_out = ifelse(game_situation == "1-1-1-0", 1, 0),
+         loaded_one_out = ifelse(game_situation == "1-1-1-1", 1, 0),
+         loaded_two_out = ifelse(game_situation == "1-1-1-2", 1, 0),
+         irisp_sit = ifelse(game_situation %in% irisp, 1, 0)
+         ) %>% 
+  group_by(pitcher, game_year) %>% 
+  summarise(irisp_pct = sum(irisp_sit)/n(),
+            fresh_inning_pct = sum(bases_empty_no_out)/n(),
+            n_appearances = n()) -> game_situations
+
+# reference data
+merge(game_situations, fangraphs %>% 
+        filter(Role == "RP") %>% 
+        select(MLBAMID, Season, gmLI, TBF),
+      by.x = c("pitcher", "game_year"), by.y = c("MLBAMID", "Season"),
+      all.x = T) %>% 
+  drop_na() %>% 
+  filter(n_appearances >= 15) %>% 
+  mutate(bf_per_appearance = TBF / n_appearances) -> pitcher_role_df
+
+predictors <- c("gmLI", "irisp_pct", "fresh_inning_pct",
+                "bf_per_appearance")
+
+# reliever role model data
+pitcher_role_df %>%
+  mutate(across(.cols = predictors, ~ntile(., 100), 
+                .names = "{.col}_percentile")) %>% 
+  select(contains("percentile")) -> model_data
+```
+
+## Optimizing K Clusters
+
+```{r}
+set.seed(3422354)
+
+# WSS method
+fviz_nbclust(model_data, FUN = hcut, method = "wss")$data %>% 
+  rename(wss = y) -> wss
+
+# Silhouette method
+fviz_nbclust(model_data, FUN = hcut, 
+             method = "silhouette")$data %>% 
+  rename(mean_silhouette_width = y) -> silhouette
+
+# Gap stat method
+
+clusGap(model_data, FUN = hcut, K.max = 10,
+        B = 50, method = "firstSEmax") -> gap_stat
+
+gap_stat[["Tab"]] %>% 
+  as_tibble() %>% 
+  mutate(clusters = row_number()) -> gap_stat_table
+
+# Visualize gap stat
+fviz_gap_stat(gap_stat)
+
+# look at all metrics
+merge(
+  merge(gap_stat_table, wss, by = "clusters"), 
+  silhouette, by = "clusters"
+  ) -> all_metrics
+```
+
+## Final Clustering
+
+```{r}
+set.seed(123)
+final <- agnes(model_data, method = "ward", metric = "euclidean")
+
+# optimal role clusters
+k <- 6 
+final_clusters <- cutree(as.hclust(final), k = k)
+table(final_clusters)
+
+# Visualizing clusters
+fviz_cluster(list(data = model_data, 
+                  cluster = final_clusters), labelsize = 4)
+
+pitcher_role_df %>% 
+  mutate(cluster = final_clusters) -> cluster_data
+
+# Looking at accuracy of all method types in agnes
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+
+ac <- function(x) {
+  agnes(model_data, method = x)$ac
+}
+
+map_dbl(m, ac)
+```
+
+# merge clusters #
+
+```{r}
+merge(pd_cluster_data %>% 
+        rename(pd_cluster = cluster) %>% 
+        select(MLBAMID, Season, Role, pd_cluster),
+      bb_cluster_data %>% 
+        rename(bb_cluster = cluster) %>% 
+        select(MLBAMID, Season, Role, bb_cluster),
+      by = c("MLBAMID", "Season", "Role")) %>% 
+  filter(Role == "RP") %>% 
+  select(-Role) %>% 
+  ungroup() -> clusters
+
+left_join(pitcher_management, cluster_data,
+          by = c("pitcher", "game_year")) %>% 
+  mutate(role = case_when(cluster == 1 ~ "Closer",
+                          cluster == 2 ~ "Middle Reliever",
+                          cluster == 3 ~ "Low Leverage Stopper",
+                          cluster == 4 ~ "High Leverage Stopper",
+                          cluster == 5 ~ "Specialist",
+                          cluster == 6 ~ "Long Relief")
+         ) -> pitcher_management
+
+left_join(pitcher_management, 
+          clusters, 
+          by = c("pitcher" = "MLBAMID", "game_year" = "Season")) %>% 
+  mutate(pitcher_class = case_when(
+    pd_cluster == 1 & bb_cluster == 1 ~ "Extreme GB Junk",
+    pd_cluster == 1 & bb_cluster == 2 ~ "GB Junk",
+    pd_cluster == 1 & bb_cluster == 3 ~ "Extreme FB Junk",
+    pd_cluster == 1 & bb_cluster == 4 ~ "FB Junk",
+    pd_cluster == 2 & bb_cluster == 1 ~ "Extreme GB Finesse",
+    pd_cluster == 2 & bb_cluster == 2 ~ "GB Finesse",
+    pd_cluster == 2 & bb_cluster == 3 ~ "Extreme FB Finesse",
+    pd_cluster == 2 & bb_cluster == 4 ~ "FB Finesse",
+    pd_cluster == 3 & bb_cluster == 1 ~ "Extreme GB Power",
+    pd_cluster == 3 & bb_cluster == 2 ~ "GB Power",
+    pd_cluster == 3 & bb_cluster == 3 ~ "Extreme FB Power",
+    pd_cluster == 3 & bb_cluster == 4 ~ "FB Power"
+  )) -> pitcher_management
+
+# aggregating delta run expectancy by game situation
+pitcher_management %>% 
+  group_by(pitcher_class, game_situation) %>% 
+  summarise(mean_delta_run_exp = mean(delta_run_exp))
+
+# aggregating delta run expectancy by role
+pitcher_management %>% 
+  group_by(pitcher_class, role_class) %>% 
+  summarise(mean_delta_run_exp = mean(delta_run_exp)) %>% 
+  drop_na()
+
+# aggregating delta run expectancy by pitcher and season
+pitcher_management %>% 
+  group_by(pitcher, game_year, role_class, pitcher_class) %>% 
+  summarise(mean_delta_run_exp = mean(delta_run_exp),
+            n_appearances = n()) %>% 
+  drop_na(role_class)
+```
